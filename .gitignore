@@ -1,0 +1,8 @@
+.env
+.venv/
+results/
+__pycache__/
+*.pyc
+.DS_Store
+solution.py
+pred.json
