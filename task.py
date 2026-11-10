@@ -104,7 +104,8 @@ class Sandbox:
             self._touch(code)
             out = self._run_python(code)
         elif name == "list_files":
-            out = self._list_files(inp.get("path", "."))
+            self._touch(inp.get("path", "") or "")
+            out = self._list_files(inp.get("path", ".") or ".")
         elif name == "read_file":
             self._touch(inp.get("path", ""))
             out = self._read_file(inp.get("path", ""))

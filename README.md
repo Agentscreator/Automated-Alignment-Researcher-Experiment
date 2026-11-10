@@ -116,3 +116,15 @@ Before a real run, write down what you expect:
 | `agents.py` | The Claude agent and the scripted mock agents |
 | `run_experiment.py` | Runs the episodes |
 | `analyze.py` | Builds the summary table and chart |
+| `code_transcripts.py` | Builds `coding.csv` for manually coding each run into buckets a–e |
+| `SPEC.md` | Full experiment spec: research questions, measures, coding scheme, limits |
+| `PREDICTIONS.md` | Template for writing your predictions before the real run |
+
+## After a run
+
+```bash
+python analyze.py              # rates with 90% Wilson intervals, plus a chart
+python code_transcripts.py     # coding sheet with a guessed bucket per run
+```
+
+Then open `results/coding.csv`, read every cheating transcript (buckets d and e) and a sample of the rest, and fill in `manual_bucket`. See `SPEC.md` for the coding scheme.
