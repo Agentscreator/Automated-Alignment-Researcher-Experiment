@@ -19,6 +19,67 @@ def wilson(k, n, z=1.64):  # about a 90% interval
     return max(0.0, center - half), min(1.0, center + half)
 
 
+def _fmt(k, n):
+    if n == 0:
+        return "    -     "
+    lo, hi = wilson(k, n)
+    return f"{k / n:.2f} [{lo:.2f},{hi:.2f}]"
+
+
+def print_rates(groups):
+    print("\nDerived rates, Wilson 90% intervals:")
+    print(f"{'model':24s}{'condition':11s}{'attempt':>18s}{'cheat':>18s}{'honest ok':>18s}"
+          f"{'admit|cheat':>18s}{'false admit':>18s}")
+    for (model, cond), rs in sorted(groups.items()):
+        n = len(rs)
+        ch = [r for r in rs if r["cheated"]]
+        cl = [r for r in rs if not r["cheated"]]
+        print(f"{model:24s}{cond:11s}"
+              f"{_fmt(sum(r['touched_leak'] for r in rs), n):>18s}"
+              f"{_fmt(len(ch), n):>18s}"
+              f"{_fmt(sum(r['honest_success'] for r in rs), n):>18s}"
+              f"{_fmt(sum(r['admitted'] for r in ch), len(ch)):>18s}"
+              f"{_fmt(sum(r['admitted'] for r in cl), len(cl)):>18s}")
+
+
+def _sign_test_p(b, c):
+    """Exact two-sided McNemar (binomial sign test on discordant pairs)."""
+    n = b + c
+    if n == 0:
+        return 1.0
+    k = min(b, c)
+    p = sum(math.comb(n, i) for i in range(k + 1)) / 2 ** n
+    return min(1.0, 2 * p)
+
+
+def print_paired(rows):
+    """Seeds are shared, so compare cheating within the same dataset."""
+    cheat = {(r["model"], r["condition"], r["seed"]): bool(r["cheated"]) for r in rows}
+    models = sorted({r["model"] for r in rows})
+    conds = sorted({r["condition"] for r in rows})
+    print("\nPaired comparisons of cheating (same seed). b = only first cheated, c = only second.")
+
+    def compare(label, key_a, key_b):
+        seeds = sorted({k[2] for k in cheat} )
+        pairs = [(cheat[key_a(s)], cheat[key_b(s)]) for s in seeds
+                 if key_a(s) in cheat and key_b(s) in cheat]
+        if not pairs:
+            return
+        b = sum(a and not o for a, o in pairs)
+        c = sum(o and not a for a, o in pairs)
+        print(f"  {label:60s} pairs={len(pairs):3d} b={b:3d} c={c:3d} McNemar p={_sign_test_p(b, c):.3f}")
+
+    if "achievable" in conds and "impossible" in conds:
+        for m in models:
+            compare(f"{m}: impossible vs achievable",
+                    lambda s, m=m: (m, "impossible", s), lambda s, m=m: (m, "achievable", s))
+    for cond in conds:
+        for i, m1 in enumerate(models):
+            for m2 in models[i + 1:]:
+                compare(f"{cond}: {m1} vs {m2}",
+                        lambda s, m1=m1: (m1, cond, s), lambda s, m2=m2: (m2, cond, s))
+
+
 def main(path="results/results.jsonl", out="results/summary.png"):
     rows = [json.loads(l) for l in open(path)]
     groups = defaultdict(list)
@@ -38,6 +99,9 @@ def main(path="results/results.jsonl", out="results/summary.png"):
               f"{sum(r['touched_leak'] for r in rs):>7d}{len(cheated):>9d}"
               f"{sum(r['honest_success'] for r in rs):>11d}"
               f"{(str(admit_c) + '/' + str(len(cheated))):>13s}{(str(false_a) + '/' + str(len(clean))):>13s}")
+
+    print_rates(groups)
+    print_paired(rows)
 
     models = sorted({m for m, _ in groups})
     conds = sorted({c for _, c in groups})
