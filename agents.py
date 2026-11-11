@@ -19,6 +19,30 @@ TOOLS = [
 ]
 
 
+# Prompt caching. Two breakpoints per request (the API allows 4): one on the system prompt,
+# which caches the tool definitions and the system prompt (tools render first), and one on
+# the last block of the conversation, which moves forward each call so every request reads
+# the prefix the previous one wrote. Thinking blocks can't carry cache_control; the marker
+# always lands on the final user turn. Markers go on a copy, so the stored conversation
+# (and the saved transcript) stays clean, and the agent sees the same text either way.
+CACHE = {"type": "ephemeral"}
+MAX_CACHE_BREAKPOINTS = 4
+USAGE_KEYS = ("input_tokens", "cache_write_tokens", "cache_read_tokens", "output_tokens")
+COST_KEYS = ("input", "cache_write", "cache_read", "output")
+
+
+def with_cache_marker(messages):
+    """A copy of messages, every content in block form, with cache_control on the last block."""
+    out = []
+    for m in messages:
+        content = m["content"]
+        blocks = [{"type": "text", "text": content}] if isinstance(content, str) else list(content)
+        out.append({**m, "content": blocks})
+    last = out[-1]["content"]
+    last[-1] = {**last[-1], "cache_control": CACHE}
+    return out
+
+
 def _clean_blocks(content):
     """Keep every block, thinking included. Thinking blocks must go back to the API
     unchanged (dropping them loses the model's reasoning across tool calls), and their
@@ -26,14 +50,20 @@ def _clean_blocks(content):
     return [b.model_dump(exclude_none=True) for b in content]
 
 
-# USD per million tokens (input, output), standard first-party API rates.
+# USD per million tokens, standard first-party API rates, checked against
+# platform.claude.com/docs/en/about-claude/pricing on 2026-11-11.
+#   input: uncached input    write: 5-minute cache write (1.25x input)
+#   read: cache hit (0.1x input; 0.05x on Sonnet 5.5 and Opus 5.5)    output: output
 # Thinking tokens are billed as output and are included in usage.output_tokens.
 PRICES = {
-    "claude-haiku-5-5": (0.10, 0.50),   # prompts up to 100K tokens
-    "claude-sonnet-5-5": (2.00, 10.00),
-    "claude-opus-5-5": (4.00, 20.00),
+    "claude-haiku-5-5":  {"input": 0.10, "write": 0.125, "read": 0.01, "output": 0.50},
+    "claude-sonnet-5-5": {"input": 2.00, "write": 2.50,  "read": 0.10, "output": 10.00},
+    "claude-opus-5-5":   {"input": 4.00, "write": 5.00,  "read": 0.20, "output": 20.00},
 }
-HAIKU_LONG_PROMPT = (0.50, 2.50)  # Haiku 5.5 rate for prompts over 100K tokens
+# Haiku 5.5 prompts over 100K tokens pay these for the whole request. The prompt length
+# counts input, cache writes and cache reads together.
+HAIKU_LONG_PROMPT = {"input": 0.50, "write": 0.625, "read": 0.05, "output": 2.50}
+HAIKU_LONG_THRESHOLD = 100_000
 MAX_TOKENS = 16000
 
 
@@ -50,16 +80,24 @@ class Budget:
         self.spent = 0.0
 
     @staticmethod
-    def price(model, input_tokens, output_tokens):
+    def price_parts(model, input_tokens=0, output_tokens=0, cache_write=0, cache_read=0):
+        """Dollar cost of one request, split into input, cache write, cache read and output."""
         if model not in PRICES:
             raise ValueError(f"No price for {model}; add it to PRICES in agents.py.")
-        pin, pout = PRICES[model]
-        if model == "claude-haiku-5-5" and input_tokens > 100_000:
-            pin, pout = HAIKU_LONG_PROMPT
-        return (input_tokens * pin + output_tokens * pout) / 1e6
+        p = PRICES[model]
+        if model == "claude-haiku-5-5" and input_tokens + cache_write + cache_read > HAIKU_LONG_THRESHOLD:
+            p = HAIKU_LONG_PROMPT
+        return {"input": input_tokens * p["input"] / 1e6, "cache_write": cache_write * p["write"] / 1e6,
+                "cache_read": cache_read * p["read"] / 1e6, "output": output_tokens * p["output"] / 1e6}
 
-    def check(self, model, est_input_tokens):
-        worst = self.price(model, est_input_tokens, MAX_TOKENS)
+    @classmethod
+    def price(cls, model, input_tokens=0, output_tokens=0, cache_write=0, cache_read=0):
+        return sum(cls.price_parts(model, input_tokens, output_tokens, cache_write, cache_read).values())
+
+    def check(self, model, est_prompt_tokens):
+        # Worst case: the whole prompt is written to the cache (the dearest input rate),
+        # plus a full-length reply.
+        worst = self.price(model, output_tokens=MAX_TOKENS, cache_write=est_prompt_tokens)
         if self.spent + worst > self.cap:
             raise BudgetExceeded(f"spent ${self.spent:.3f}; next call could cost up to "
                                  f"${worst:.3f}, which would pass the ${self.cap:.2f} cap")
@@ -72,30 +110,40 @@ class ClaudeAgent:
             raise RuntimeError("Set the ANTHROPIC_API_KEY environment variable first.")
         self.client = anthropic.Anthropic()
         self.model = model
-        Budget.price(model, 0, 0)  # fail fast on a model with no known price
+        Budget.price(model)  # fail fast on a model with no known price
         self.budget = budget
-        self.usage = {"input_tokens": 0, "output_tokens": 0}
+        self.usage = dict.fromkeys(USAGE_KEYS, 0)
+        self.cost_parts = dict.fromkeys(COST_KEYS, 0.0)
         self.cost = 0.0
         self.stop_reasons = []
-        self._last_input = 0
+        self._last_prompt = 0  # total prompt tokens of the last request, cached or not
 
     def next(self, system, messages, no_tools=False):
         # The next prompt is the last one plus at most one turn of output and tool results.
-        self.budget.check(self.model, self._last_input + MAX_TOKENS + 5000)
+        self.budget.check(self.model, self._last_prompt + MAX_TOKENS + 5000)
         # No server-side refusal fallbacks on purpose: a silent switch to another
         # model would contaminate the model comparison. Refusals are recorded instead.
-        kwargs = dict(model=self.model, max_tokens=MAX_TOKENS, system=system,
-                      tools=TOOLS, messages=messages,
+        kwargs = dict(model=self.model, max_tokens=MAX_TOKENS,
+                      system=[{"type": "text", "text": system, "cache_control": CACHE}],
+                      tools=TOOLS, messages=with_cache_marker(messages),
                       thinking={"type": "adaptive", "display": "summarized"})
         if no_tools:
             kwargs["tool_choice"] = {"type": "none"}
         resp = self.client.messages.create(**kwargs)
-        self.usage["input_tokens"] += resp.usage.input_tokens
-        self.usage["output_tokens"] += resp.usage.output_tokens
-        call_cost = Budget.price(self.model, resp.usage.input_tokens, resp.usage.output_tokens)
+        u = resp.usage
+        tokens = {"input_tokens": u.input_tokens or 0, "output_tokens": u.output_tokens or 0,
+                  "cache_write_tokens": getattr(u, "cache_creation_input_tokens", 0) or 0,
+                  "cache_read_tokens": getattr(u, "cache_read_input_tokens", 0) or 0}
+        for k, v in tokens.items():
+            self.usage[k] += v
+        parts = Budget.price_parts(self.model, tokens["input_tokens"], tokens["output_tokens"],
+                                   tokens["cache_write_tokens"], tokens["cache_read_tokens"])
+        for k, v in parts.items():
+            self.cost_parts[k] += v
+        call_cost = sum(parts.values())
         self.cost += call_cost
         self.budget.spent += call_cost
-        self._last_input = resp.usage.input_tokens
+        self._last_prompt = tokens["input_tokens"] + tokens["cache_write_tokens"] + tokens["cache_read_tokens"]
         self.stop_reasons.append(resp.stop_reason)
         if resp.stop_reason in ("refusal", "max_tokens"):
             # A truncated tool_use can't be run; end the episode on a text-only turn.
@@ -179,7 +227,7 @@ class MockAgent:
         if policy not in MOCK_SPECS:
             raise ValueError(f"unknown mock policy {policy!r}")
         self.policy = policy
-        self.usage = {"input_tokens": 0, "output_tokens": 0}
+        self.usage = dict.fromkeys(USAGE_KEYS, 0)
 
     def next(self, system, messages, no_tools=False):
         from prompts import REPORT_Q

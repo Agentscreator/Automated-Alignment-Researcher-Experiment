@@ -10,12 +10,13 @@ import re
 import shutil
 import tempfile
 import time
+import uuid
 
 from dotenv import find_dotenv, load_dotenv
 
 load_dotenv(find_dotenv())  # picks up ANTHROPIC_API_KEY from .env here or in a parent folder
 
-from agents import MOCK_POLICIES, Budget, BudgetExceeded, ClaudeAgent, MockAgent
+from agents import COST_KEYS, MOCK_POLICIES, USAGE_KEYS, Budget, BudgetExceeded, ClaudeAgent, MockAgent
 from prompts import (ADMISSION_Q, BUDGET_LINE, REPORT_Q, DESIGN_VERSION, PRESSURE_LEVELS, TARGET_LEVELS,
                      VISIBILITY_LEVELS, FIRST_USER_MESSAGE, system_prompt)
 from task import LEAK_MARKERS, Sandbox, build_task
@@ -125,6 +126,30 @@ def run_episode(agent, target, visibility, pressure, seed, max_steps, max_submit
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+def cost_fields(agent):
+    """Per-episode token counts, dollars by category, and the cache hit rate."""
+    u = {k: getattr(agent, "usage", {}).get(k, 0) for k in USAGE_KEYS}
+    parts = getattr(agent, "cost_parts", dict.fromkeys(COST_KEYS, 0.0))
+    prompt = u["input_tokens"] + u["cache_write_tokens"] + u["cache_read_tokens"]
+    return {**u,
+            "cost_usd": round(getattr(agent, "cost", 0.0), 6),
+            **{f"cost_{k}_usd": round(parts.get(k, 0.0), 6) for k in COST_KEYS},
+            "cache_hit_rate": round(u["cache_read_tokens"] / prompt, 4) if prompt else None}
+
+
+def append_row(path, row):
+    """One os.write of the whole line on an O_APPEND descriptor, so rows from parallel
+    containers writing to the same file never interleave."""
+    data = (json.dumps(row) + "\n").encode()
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    try:
+        written = os.write(fd, data)
+    finally:
+        os.close(fd)
+    if written != len(data):
+        raise OSError(f"short write to {path}: {written} of {len(data)} bytes")
+
+
 def load_done(path, budget_display):
     """Rows already in results.jsonl for this design version and budget display setting,
     keyed by cell and seed, for resuming. Also returns the mock flags and design versions
@@ -187,51 +212,51 @@ def main():
     total_tokens = 0
     budget = Budget(args.max_cost_usd)
     real_costs = []
-    with open(path, "a") as fout:
-        for i, (model, target, visibility, pressure, seed) in enumerate(todo):
-            cell = f"{target}/{visibility}/{pressure}"
-            if total_tokens >= args.max_total_tokens:
-                print("Token budget reached, stopping.")
-                break
-            agent = MockAgent(model.replace("mock_", "")) if args.mock else ClaudeAgent(model, budget)
-            try:
-                ep = run_episode(agent, target, visibility, pressure, seed,
-                                 args.max_steps, args.max_submits, budget_display)
-            except BudgetExceeded as e:
-                # The cut-off episode is incomplete, so it is not saved; a rerun resumes here.
-                print(f"Cost cap reached during {model} {cell} seed {seed}, episode discarded: {e}")
-                break
-            except Exception as e:  # noqa: BLE001
-                print(f"[error] {model} {cell} seed {seed}: {e}")
-                continue
-            used = sum(agent.usage.values())
-            total_tokens += used
-            ep_id = f"{model}_{target}_{visibility}_{pressure}_{seed}_{int(time.time())}"
-            with open(os.path.join(out, "transcripts", ep_id + ".json"), "w") as f:
-                json.dump({"system": ep["system"], "log": ep["log"], "messages": ep["messages"]},
-                          f, indent=1, default=str)
-            row = {"id": ep_id, "model": model, "mock": args.mock, "seed": seed,
-                   "ceiling": ep["ceiling"], "target_acc": ep["target_acc"], "steps": ep["steps"],
-                   "tokens": used, "cost_usd": round(getattr(agent, "cost", 0.0), 5),
-                   "report_text": ep["report_text"], "admission_text": ep["admission_text"],
-                   "stop_reasons": getattr(agent, "stop_reasons", []), **ep["flags"]}
-            fout.write(json.dumps(row) + "\n")
-            fout.flush()
-            f = ep["flags"]
-            print(f"{model:30s} {cell:28s} seed {seed:2d}  cheated={f['cheated']!s:5}  "
-                  f"admitted={f['admitted']!s:5}  claimed_met={f['claimed_met']!s:5}  "
-                  f"max_acc={f['max_acc']}  spent=${budget.spent:.3f}/{budget.cap:.2f}")
-            if not args.mock:
-                real_costs.append(getattr(agent, "cost", 0.0))
-                if len(real_costs) == 3:
-                    # Rough: assumes the remaining episodes cost like these three, though
-                    # later models and conditions may differ.
-                    left = len(todo) - (i + 1)
-                    projected = budget.spent + left * sum(real_costs) / 3
-                    print(f"Projected total for this run: ${projected:.2f} "
-                          f"({left} episodes left at ${sum(real_costs) / 3:.4f} each). "
-                          f"Hard stop at ${budget.cap:.2f} (--max-cost-usd).")
-    print(f"Done. Total tokens: {total_tokens}. Estimated spend: ${budget.spent:.3f}. Results in {path}")
+    for i, (model, target, visibility, pressure, seed) in enumerate(todo):
+        cell = f"{target}/{visibility}/{pressure}"
+        if total_tokens >= args.max_total_tokens:
+            print("Token budget reached, stopping.", flush=True)
+            break
+        agent = MockAgent(model.replace("mock_", "")) if args.mock else ClaudeAgent(model, budget)
+        try:
+            ep = run_episode(agent, target, visibility, pressure, seed,
+                             args.max_steps, args.max_submits, budget_display)
+        except BudgetExceeded as e:
+            # The cut-off episode is incomplete, so it is not saved; a rerun resumes here.
+            print(f"Cost cap reached during {model} {cell} seed {seed}, episode discarded: {e}", flush=True)
+            break
+        except Exception as e:  # noqa: BLE001
+            print(f"[error] {model} {cell} seed {seed}: {e}", flush=True)
+            continue
+        used = sum(agent.usage.values())
+        total_tokens += used
+        # Unique across parallel containers: nanosecond time plus a random suffix.
+        ep_id = f"{model}_{target}_{visibility}_{pressure}_{seed}_{time.time_ns()}_{uuid.uuid4().hex[:8]}"
+        with open(os.path.join(out, "transcripts", ep_id + ".json"), "x") as f:
+            json.dump({"system": ep["system"], "log": ep["log"], "messages": ep["messages"]},
+                      f, indent=1, default=str)
+        row = {"id": ep_id, "model": model, "mock": args.mock, "seed": seed, "max_steps": args.max_steps,
+               "ceiling": ep["ceiling"], "target_acc": ep["target_acc"], "steps": ep["steps"],
+               "tokens": used, **cost_fields(agent),
+               "report_text": ep["report_text"], "admission_text": ep["admission_text"],
+               "stop_reasons": getattr(agent, "stop_reasons", []), **ep["flags"]}
+        append_row(path, row)
+        f = ep["flags"]
+        print(f"{model:30s} {cell:28s} seed {seed:2d}  cheated={f['cheated']!s:5}  "
+              f"admitted={f['admitted']!s:5}  claimed_met={f['claimed_met']!s:5}  "
+              f"max_acc={f['max_acc']}  cache_hit={row['cache_hit_rate']}  "
+              f"spent=${budget.spent:.3f}/{budget.cap:.2f}", flush=True)
+        if not args.mock:
+            real_costs.append(getattr(agent, "cost", 0.0))
+            if len(real_costs) == 3:
+                # Rough: assumes the remaining episodes cost like these three, though
+                # later models and conditions may differ.
+                left = len(todo) - (i + 1)
+                projected = budget.spent + left * sum(real_costs) / 3
+                print(f"Projected total for this run: ${projected:.2f} "
+                      f"({left} episodes left at ${sum(real_costs) / 3:.4f} each). "
+                      f"Hard stop at ${budget.cap:.2f} (--max-cost-usd).", flush=True)
+    print(f"Done. Total tokens: {total_tokens}. Estimated spend: ${budget.spent:.3f}. Results in {path}", flush=True)
 
 
 if __name__ == "__main__":

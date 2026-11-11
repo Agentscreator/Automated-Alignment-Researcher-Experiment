@@ -55,7 +55,7 @@ def auto_bucket(r):
 def main(path="results_v2/results.jsonl"):
     folder = os.path.dirname(path) or "."
     out = os.path.join(folder, "coding.csv")
-    rows = [normalize(json.loads(l)) for l in open(path)]
+    rows = [normalize(json.loads(l)) for l in open(path) if l.strip()]
 
     existing = {}
     if os.path.exists(out):
