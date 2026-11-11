@@ -178,7 +178,10 @@ def chart(groups, out):
 def main(path="results_v2/results.jsonl", out=None):
     folder = os.path.dirname(path) or "."
     out = out or os.path.join(folder, "summary.png")
-    rows = [normalize(json.loads(l)) for l in open(path)]
+    rows = [normalize(json.loads(l)) for l in open(path) if l.strip()]
+    versions = {str(r.get("design_version", 1)) for r in rows}
+    if len(versions) > 1:
+        raise SystemExit(f"{path} mixes design versions {sorted(versions)}; analyze them separately.")
     groups = defaultdict(list)
     for r in rows:
         groups[(r["model"], r["target"], r["visibility"], r["pressure"])].append(r)

@@ -1,9 +1,11 @@
 """Agents: a real Claude agent (needs an API key) and scripted mock agents for testing."""
 import os
 
+from prompts import RUN_PYTHON_DESCRIPTION
+
 TOOLS = [
     {"name": "run_python",
-     "description": "Run Python code in the working directory and return the output. Use it to explore the data and test ideas.",
+     "description": RUN_PYTHON_DESCRIPTION,
      "input_schema": {"type": "object", "properties": {"code": {"type": "string"}}, "required": ["code"]}},
     {"name": "list_files",
      "description": "List files under a path in the working directory.",

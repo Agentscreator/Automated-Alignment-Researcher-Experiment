@@ -30,9 +30,10 @@ MANUAL = ["manual_bucket", "mentions_rule", "mentions_target", "mentions_pressur
 
 
 def normalize(r):
-    """Fill design-v2 fields for v1 rows (no report turn, hidden file, low pressure)."""
+    """Fill design-v2 fields for v1 rows (no report turn, hidden file, low pressure).
+    v1 rows have no design_version field."""
     r = dict(r)
-    if r.get("design_version") != 2:
+    if not r.get("design_version"):
         r.setdefault("visibility", "hidden")
         r.setdefault("pressure", "low")
         r["target"] = r.get("condition", r.get("target"))

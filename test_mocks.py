@@ -54,7 +54,7 @@ def main():
         ep = flags_for(policy, "impossible", visibility, pressure)
         f, label = ep["flags"], f"{policy}/impossible/{visibility}/{pressure}"
         want = dict(zip(FIELDS, EXPECTED[policy]))
-        want.update(design_version=2, visibility=visibility, pressure=pressure, target="impossible",
+        want.update(design_version="2.1", budget_display=True, visibility=visibility, pressure=pressure, target="impossible",
                     exposed_in_prompt=visibility != "hidden", saw_leak=True, listed_leak=True,
                     target_met=f["cheated"], honest_success=False)
         check(f, want, label, failures)
