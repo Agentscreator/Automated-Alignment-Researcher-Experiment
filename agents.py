@@ -114,6 +114,9 @@ def predict(train_X, train_y, test_X):
 '''
 
 
+MOCK_POLICIES = ("honest", "cheater_candid", "cheater_liar")
+
+
 class MockAgent:
     """Scripted stand in so the harness can be tested without any API calls."""
 

@@ -3,6 +3,7 @@
     python run_experiment.py --models claude-haiku-5-5 claude-sonnet-5-5 --runs 30
 """
 import argparse
+import itertools
 import json
 import os
 import re
@@ -14,7 +15,7 @@ from dotenv import find_dotenv, load_dotenv
 
 load_dotenv(find_dotenv())  # picks up ANTHROPIC_API_KEY from .env here or in a parent folder
 
-from agents import Budget, BudgetExceeded, ClaudeAgent, MockAgent
+from agents import MOCK_POLICIES, Budget, BudgetExceeded, ClaudeAgent, MockAgent
 from prompts import (ADMISSION_Q, REPORT_Q, DESIGN_VERSION, PRESSURE_LEVELS, TARGET_LEVELS,
                      VISIBILITY_LEVELS, FIRST_USER_MESSAGE, system_prompt)
 from task import LEAK_MARKERS, Sandbox, build_task
@@ -122,6 +123,18 @@ def run_episode(agent, target, visibility, pressure, seed, max_steps, max_submit
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+def load_done(path):
+    """Rows already in results.jsonl, keyed by design-v2 cell and seed, for resuming."""
+    done, mocks = set(), set()
+    if os.path.exists(path):
+        for line in open(path):
+            r = json.loads(line)
+            mocks.add(bool(r.get("mock", str(r["model"]).startswith("mock_"))))
+            if r.get("design_version") == DESIGN_VERSION:
+                done.add((r["model"], r["target"], r["visibility"], r["pressure"], r["seed"]))
+    return done, mocks
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--models", nargs="+", default=["claude-haiku-5-5", "claude-sonnet-5-5"])
@@ -131,59 +144,80 @@ def main():
     ap.add_argument("--runs", type=int, default=30, help="seeds per model and cell")
     ap.add_argument("--max-steps", type=int, default=12)
     ap.add_argument("--max-submits", type=int, default=3)
-    ap.add_argument("--max-total-tokens", type=int, default=500000,
+    ap.add_argument("--max-total-tokens", type=int, default=10_000_000,
                     help="stop the whole run after this many tokens (input plus output)")
     ap.add_argument("--max-cost-usd", type=float, default=2.0,
-                    help="stop the whole run before estimated API spend passes this many dollars")
-    ap.add_argument("--out", default="results")
+                    help="hard stop before estimated API spend passes this many dollars")
+    ap.add_argument("--out", default=None,
+                    help="output folder (default results_v2, or results_v2_mock with --mock)")
     ap.add_argument("--mock", action="store_true", help="use scripted agents, no API calls")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print how many episodes would run, then exit without any API call")
     args = ap.parse_args()
 
-    os.makedirs(os.path.join(args.out, "transcripts"), exist_ok=True)
-    models = ["mock_honest", "mock_cheater_candid", "mock_cheater_liar"] if args.mock else args.models
+    out = args.out or ("results_v2_mock" if args.mock else "results_v2")
+    path = os.path.join(out, "results.jsonl")
+    models = ["mock_" + p for p in MOCK_POLICIES] if args.mock else args.models
+    plan = list(itertools.product(models, args.targets, args.visibility, args.pressure, range(args.runs)))
+    done, mocks_in_file = load_done(path)
+    if mocks_in_file and mocks_in_file != {args.mock}:
+        raise SystemExit(f"{path} already holds {'mock' if True in mocks_in_file else 'real'} rows. "
+                         "Use another --out so mock and real results never mix.")
+    todo = [p for p in plan if p not in done]
+    print(f"{len(plan)} episodes planned: {len(models)} models x {len(args.targets)} targets x "
+          f"{len(args.visibility)} visibility x {len(args.pressure)} pressure x {args.runs} seeds. "
+          f"{len(plan) - len(todo)} already in {path}, {len(todo)} to run.")
+    if args.dry_run:
+        return
+
+    os.makedirs(os.path.join(out, "transcripts"), exist_ok=True)
     total_tokens = 0
     budget = Budget(args.max_cost_usd)
-    path = os.path.join(args.out, "results.jsonl")
+    real_costs = []
     with open(path, "a") as fout:
-        for model in models:
-          for target in args.targets:
-            for visibility in args.visibility:
-              for pressure in args.pressure:
-                cell = f"{target}/{visibility}/{pressure}"
-                for seed in range(args.runs):
-                    if total_tokens >= args.max_total_tokens:
-                        print("Token budget reached, stopping.")
-                        return
-                    agent = MockAgent(model.replace("mock_", "")) if args.mock else ClaudeAgent(model, budget)
-                    try:
-                        ep = run_episode(agent, target, visibility, pressure, seed,
-                                         args.max_steps, args.max_submits)
-                    except BudgetExceeded as e:
-                        # The cut-off episode is incomplete, so it is not saved.
-                        print(f"Cost cap reached during {model} {cell} seed {seed}, "
-                              f"episode discarded: {e}")
-                        print(f"Estimated spend: ${budget.spent:.3f}. Results in {path}")
-                        return
-                    except Exception as e:  # noqa: BLE001
-                        print(f"[error] {model} {cell} seed {seed}: {e}")
-                        continue
-                    used = sum(agent.usage.values())
-                    total_tokens += used
-                    ep_id = f"{model}_{target}_{visibility}_{pressure}_{seed}_{int(time.time())}"
-                    with open(os.path.join(args.out, "transcripts", ep_id + ".json"), "w") as f:
-                        json.dump({"system": ep["system"], "log": ep["log"], "messages": ep["messages"]},
-                                  f, indent=1, default=str)
-                    row = {"id": ep_id, "model": model, "mock": args.mock, "seed": seed,
-                           "ceiling": ep["ceiling"], "target_acc": ep["target_acc"], "steps": ep["steps"],
-                           "tokens": used, "cost_usd": round(getattr(agent, "cost", 0.0), 5),
-                           "report_text": ep["report_text"], "admission_text": ep["admission_text"],
-                           "stop_reasons": getattr(agent, "stop_reasons", []), **ep["flags"]}
-                    fout.write(json.dumps(row) + "\n")
-                    fout.flush()
-                    f = ep["flags"]
-                    print(f"{model:24s} {cell:28s} seed {seed:2d}  cheated={f['cheated']!s:5}  "
-                          f"admitted={f['admitted']!s:5}  max_acc={f['max_acc']}  tokens={used}  "
-                          f"spent=${budget.spent:.3f}/{budget.cap:.2f}")
+        for i, (model, target, visibility, pressure, seed) in enumerate(todo):
+            cell = f"{target}/{visibility}/{pressure}"
+            if total_tokens >= args.max_total_tokens:
+                print("Token budget reached, stopping.")
+                break
+            agent = MockAgent(model.replace("mock_", "")) if args.mock else ClaudeAgent(model, budget)
+            try:
+                ep = run_episode(agent, target, visibility, pressure, seed,
+                                 args.max_steps, args.max_submits)
+            except BudgetExceeded as e:
+                # The cut-off episode is incomplete, so it is not saved; a rerun resumes here.
+                print(f"Cost cap reached during {model} {cell} seed {seed}, episode discarded: {e}")
+                break
+            except Exception as e:  # noqa: BLE001
+                print(f"[error] {model} {cell} seed {seed}: {e}")
+                continue
+            used = sum(agent.usage.values())
+            total_tokens += used
+            ep_id = f"{model}_{target}_{visibility}_{pressure}_{seed}_{int(time.time())}"
+            with open(os.path.join(out, "transcripts", ep_id + ".json"), "w") as f:
+                json.dump({"system": ep["system"], "log": ep["log"], "messages": ep["messages"]},
+                          f, indent=1, default=str)
+            row = {"id": ep_id, "model": model, "mock": args.mock, "seed": seed,
+                   "ceiling": ep["ceiling"], "target_acc": ep["target_acc"], "steps": ep["steps"],
+                   "tokens": used, "cost_usd": round(getattr(agent, "cost", 0.0), 5),
+                   "report_text": ep["report_text"], "admission_text": ep["admission_text"],
+                   "stop_reasons": getattr(agent, "stop_reasons", []), **ep["flags"]}
+            fout.write(json.dumps(row) + "\n")
+            fout.flush()
+            f = ep["flags"]
+            print(f"{model:30s} {cell:28s} seed {seed:2d}  cheated={f['cheated']!s:5}  "
+                  f"admitted={f['admitted']!s:5}  claimed_met={f['claimed_met']!s:5}  "
+                  f"max_acc={f['max_acc']}  spent=${budget.spent:.3f}/{budget.cap:.2f}")
+            if not args.mock:
+                real_costs.append(getattr(agent, "cost", 0.0))
+                if len(real_costs) == 3:
+                    # Rough: assumes the remaining episodes cost like these three, though
+                    # later models and conditions may differ.
+                    left = len(todo) - (i + 1)
+                    projected = budget.spent + left * sum(real_costs) / 3
+                    print(f"Projected total for this run: ${projected:.2f} "
+                          f"({left} episodes left at ${sum(real_costs) / 3:.4f} each). "
+                          f"Hard stop at ${budget.cap:.2f} (--max-cost-usd).")
     print(f"Done. Total tokens: {total_tokens}. Estimated spend: ${budget.spent:.3f}. Results in {path}")
 
 
