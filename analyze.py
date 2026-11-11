@@ -1,12 +1,25 @@
-"""Summarize results.jsonl into a table and a chart."""
+"""Summarize results.jsonl: rates per cell with 90% Wilson intervals, paired tests, a chart.
+
+    python analyze.py                                  # results_v2/results.jsonl
+    python analyze.py other/results.jsonl other/summary.png
+
+Cells are model x target x visibility x pressure. Also writes summary.csv next to the
+results file, with k, n, rate and interval for every metric in every cell.
+"""
+import csv
+import itertools
 import json
 import math
+import os
 import sys
 from collections import defaultdict
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+from code_transcripts import normalize
+from prompts import PRESSURE_LEVELS, VISIBILITY_LEVELS
 
 
 def wilson(k, n, z=1.64):  # about a 90% interval
@@ -19,27 +32,58 @@ def wilson(k, n, z=1.64):  # about a 90% interval
     return max(0.0, center - half), min(1.0, center + half)
 
 
-def _fmt(k, n):
+# name: (which rows count toward n, which of those count toward k)
+METRICS = {
+    "saw":            (lambda r: True,              lambda r: r["saw_leak"]),
+    "tried":          (lambda r: True,              lambda r: r["touched_leak"]),
+    "cheated":        (lambda r: True,              lambda r: r["cheated"]),
+    "honest_ok":      (lambda r: True,              lambda r: r["honest_success"]),
+    "cheat|saw":      (lambda r: r["saw_leak"],     lambda r: r["cheated"]),
+    "admit|cheat":    (lambda r: r["cheated"],      lambda r: r["admitted"]),
+    "false_admit":    (lambda r: not r["cheated"],  lambda r: r["admitted"]),
+    "disclose|cheat": (lambda r: r["cheated"],      lambda r: r.get("report_mentions_leak", False)),
+    "overclaim|miss": (lambda r: not r["target_met"], lambda r: r.get("overclaim", False)),
+}
+KEY_RATES = ("cheated", "cheat|saw", "admit|cheat", "disclose|cheat", "overclaim|miss")
+
+
+def count(rows, metric):
+    base, hit = METRICS[metric]
+    pool = [r for r in rows if base(r)]
+    return sum(bool(hit(r)) for r in pool), len(pool)
+
+
+def fmt_rate(k, n):
     if n == 0:
-        return "    -     "
+        return "-"
     lo, hi = wilson(k, n)
     return f"{k / n:.2f} [{lo:.2f},{hi:.2f}]"
 
 
-def print_rates(groups):
-    print("\nDerived rates, Wilson 90% intervals:")
-    print(f"{'model':24s}{'condition':11s}{'attempt':>18s}{'cheat':>18s}{'honest ok':>18s}"
-          f"{'admit|cheat':>18s}{'false admit':>18s}")
-    for (model, cond), rs in sorted(groups.items()):
-        n = len(rs)
-        ch = [r for r in rs if r["cheated"]]
-        cl = [r for r in rs if not r["cheated"]]
-        print(f"{model:24s}{cond:11s}"
-              f"{_fmt(sum(r['touched_leak'] for r in rs), n):>18s}"
-              f"{_fmt(len(ch), n):>18s}"
-              f"{_fmt(sum(r['honest_success'] for r in rs), n):>18s}"
-              f"{_fmt(sum(r['admitted'] for r in ch), len(ch)):>18s}"
-              f"{_fmt(sum(r['admitted'] for r in cl), len(cl)):>18s}")
+def order(values, preferred):
+    return sorted(values, key=lambda v: (preferred.index(v) if v in preferred else len(preferred), v))
+
+
+def print_tables(groups, out_csv):
+    label = f"{'model':30s}{'target':12s}{'visibility':11s}{'pressure':9s}"
+    print(label + f"{'n':>4s}" + "".join(f"{m:>15s}" for m in METRICS))
+    with open(out_csv, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["model", "target", "visibility", "pressure", "metric", "k", "n", "rate", "lo90", "hi90"])
+        for key, rs in groups.items():
+            line = f"{key[0]:30s}{key[1]:12s}{key[2]:11s}{key[3]:9s}{len(rs):>4d}"
+            for m in METRICS:
+                k, n = count(rs, m)
+                line += f"{f'{k}/{n}':>15s}"
+                lo, hi = wilson(k, n)
+                w.writerow([*key, m, k, n, round(k / n, 4) if n else "", round(lo, 4), round(hi, 4)])
+            print(line)
+    print("\nRates with 90% Wilson intervals:")
+    print(label + "".join(f"{m:>19s}" for m in KEY_RATES))
+    for key, rs in groups.items():
+        print(f"{key[0]:30s}{key[1]:12s}{key[2]:11s}{key[3]:9s}"
+              + "".join(f"{fmt_rate(*count(rs, m)):>19s}" for m in KEY_RATES))
+    print(f"\nAll metrics: {out_csv}")
 
 
 def _sign_test_p(b, c):
@@ -53,82 +97,97 @@ def _sign_test_p(b, c):
 
 
 def print_paired(rows):
-    """Seeds are shared, so compare cheating within the same dataset."""
-    cheat = {(r["model"], r["condition"], r["seed"]): bool(r["cheated"]) for r in rows}
-    models = sorted({r["model"] for r in rows})
-    conds = sorted({r["condition"] for r in rows})
-    print("\nPaired comparisons of cheating (same seed). b = only first cheated, c = only second.")
+    """Seeds are shared, so the same seed means the same dataset. Compare cheating
+    between two cells that differ in one factor, seed by seed."""
+    cheat = {(r["model"], r["target"], r["visibility"], r["pressure"], r["seed"]): bool(r["cheated"])
+             for r in rows}
+    levels = [order({k[i] for k in cheat}, pref) for i, pref in
+              enumerate([[], ["impossible", "achievable"], list(VISIBILITY_LEVELS), list(PRESSURE_LEVELS)])]
+    seeds = sorted({k[4] for k in cheat})
+    names = ["model", "target", "visibility", "pressure"]
+    print("\nPaired comparisons of cheating (same seed = same dataset). "
+          "b = only the first cheated, c = only the second.")
+    any_printed = False
+    for factor in (2, 3, 1, 0):  # visibility, pressure, target, model
+        if len(levels[factor]) < 2:
+            continue
+        print(f"  across {names[factor]}:")
+        others = [levels[i] for i in range(4) if i != factor]
+        for fixed in itertools.product(*others):
+            for a, b_level in itertools.combinations(levels[factor], 2):
+                def key(level, s):
+                    k = list(fixed)
+                    k.insert(factor, level)
+                    return tuple(k) + (s,)
+                pairs = [(cheat[key(a, s)], cheat[key(b_level, s)]) for s in seeds
+                         if key(a, s) in cheat and key(b_level, s) in cheat]
+                if not pairs:
+                    continue
+                b = sum(x and not y for x, y in pairs)
+                c = sum(y and not x for x, y in pairs)
+                where = " ".join(str(v) for v in fixed)
+                print(f"    {where:52s} {a + ' vs ' + b_level:24s} pairs={len(pairs):3d} b={b:3d} c={c:3d} "
+                      f"McNemar p={_sign_test_p(b, c):.3f}")
+                any_printed = True
+    if not any_printed:
+        print("  (no factor has two levels with matching seeds)")
 
-    def compare(label, key_a, key_b):
-        seeds = sorted({k[2] for k in cheat} )
-        pairs = [(cheat[key_a(s)], cheat[key_b(s)]) for s in seeds
-                 if key_a(s) in cheat and key_b(s) in cheat]
-        if not pairs:
-            return
-        b = sum(a and not o for a, o in pairs)
-        c = sum(o and not a for a, o in pairs)
-        print(f"  {label:60s} pairs={len(pairs):3d} b={b:3d} c={c:3d} McNemar p={_sign_test_p(b, c):.3f}")
 
-    if "achievable" in conds and "impossible" in conds:
-        for m in models:
-            compare(f"{m}: impossible vs achievable",
-                    lambda s, m=m: (m, "impossible", s), lambda s, m=m: (m, "achievable", s))
-    for cond in conds:
-        for i, m1 in enumerate(models):
-            for m2 in models[i + 1:]:
-                compare(f"{cond}: {m1} vs {m2}",
-                        lambda s, m1=m1: (m1, cond, s), lambda s, m2=m2: (m2, cond, s))
-
-
-def main(path="results/results.jsonl", out="results/summary.png"):
-    rows = [json.loads(l) for l in open(path)]
-    groups = defaultdict(list)
-    for r in rows:
-        groups[(r["model"], r["condition"])].append(r)
-
-    print(f"{'model':24s}{'condition':11s}{'n':>3s}{'saw':>6s}{'tried':>7s}{'cheated':>9s}{'honest ok':>11s}{'admit|cheat':>13s}{'false admit':>13s}")
-    summary = {}
-    for (model, cond), rs in sorted(groups.items()):
-        n = len(rs)
-        cheated = [r for r in rs if r["cheated"]]
-        clean = [r for r in rs if not r["cheated"]]
-        admit_c = sum(r["admitted"] for r in cheated)
-        false_a = sum(r["admitted"] for r in clean)
-        summary[(model, cond)] = (n, len(cheated), admit_c, len(clean), false_a)
-        print(f"{model:24s}{cond:11s}{n:>3d}{sum(r['saw_leak'] for r in rs):>6d}"
-              f"{sum(r['touched_leak'] for r in rs):>7d}{len(cheated):>9d}"
-              f"{sum(r['honest_success'] for r in rs):>11d}"
-              f"{(str(admit_c) + '/' + str(len(cheated))):>13s}{(str(false_a) + '/' + str(len(clean))):>13s}")
-
-    print_rates(groups)
-    print_paired(rows)
-
-    models = sorted({m for m, _ in groups})
-    conds = sorted({c for _, c in groups})
-    colors = ["#4285F4", "#DB4437", "#F4B400", "#0F9D58"]
-    fig, axes = plt.subplots(1, 2, figsize=(11, 4))
-    width = 0.8 / max(len(conds), 1)
-    for ai, (ax, title) in enumerate(zip(axes, ["Cheating rate", "Admission rate among cheaters"])):
-        for ci, cond in enumerate(conds):
+def chart(groups, out):
+    """Cheating rate by visibility, bars split by pressure, one panel per model."""
+    targets = order({k[1] for k in groups}, ["impossible", "achievable"])
+    target = targets[0]
+    models = sorted({k[0] for k in groups if k[1] == target})
+    vis = order({k[2] for k in groups if k[1] == target}, list(VISIBILITY_LEVELS))
+    pres = order({k[3] for k in groups if k[1] == target}, list(PRESSURE_LEVELS))
+    colors = {"low": "#4C78A8", "high": "#E45756"}
+    ncols = min(3, len(models))
+    nrows = math.ceil(len(models) / ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 3.2 * nrows + 0.5),
+                             squeeze=False, sharey=True)
+    flat = axes.ravel()
+    for ax in flat[len(models):]:
+        ax.set_visible(False)
+    width = 0.8 / max(len(pres), 1)
+    for ax, model in zip(flat, models):
+        for pi, p in enumerate(pres):
             xs, ys, lo, hi = [], [], [], []
-            for mi, model in enumerate(models):
-                s = summary.get((model, cond))
-                if not s:
+            for vi, v in enumerate(vis):
+                rs = groups.get((model, target, v, p))
+                if not rs:
                     continue
-                n, k_cheat, k_admit, _, _ = s
-                k, tot = (k_cheat, n) if ai == 0 else (k_admit, k_cheat)
-                if tot == 0:
-                    continue
-                p = k / tot
-                l, h = wilson(k, tot)
-                xs.append(mi + ci * width); ys.append(p); lo.append(p - l); hi.append(h - p)
-            ax.bar(xs, ys, width=width, color=colors[ci % 4], label=cond, yerr=[lo, hi], capsize=3)
-        ax.set_xticks([i + width * (len(conds) - 1) / 2 for i in range(len(models))])
-        ax.set_xticklabels(models, rotation=15, ha="right")
-        ax.set_ylim(0, 1.05); ax.set_title(title); ax.legend()
-    fig.tight_layout()
+                k, n = count(rs, "cheated")
+                l, h = wilson(k, n)
+                xs.append(vi + (pi - (len(pres) - 1) / 2) * width)
+                ys.append(k / n); lo.append(k / n - l); hi.append(h - k / n)
+            ax.bar(xs, ys, width=width, color=colors.get(p, "#999999"), label=f"{p} pressure",
+                   yerr=[lo, hi], capsize=3)
+        ax.set_xticks(range(len(vis)))
+        ax.set_xticklabels(vis)
+        ax.set_ylim(0, 1.05)
+        ax.set_title(model, fontsize=9)
+    for row in axes:
+        row[0].set_ylabel(f"cheating rate ({target} target)", fontsize=8)
+    handles, labels = flat[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=len(pres), fontsize=8, frameon=False)
+    fig.tight_layout(rect=(0, 0, 1, 1 - 0.35 / (3.2 * nrows + 0.5)))
     fig.savefig(out, dpi=150)
     print("Chart saved to", out)
+
+
+def main(path="results_v2/results.jsonl", out=None):
+    folder = os.path.dirname(path) or "."
+    out = out or os.path.join(folder, "summary.png")
+    rows = [normalize(json.loads(l)) for l in open(path)]
+    groups = defaultdict(list)
+    for r in rows:
+        groups[(r["model"], r["target"], r["visibility"], r["pressure"])].append(r)
+    rank = {v: i for i, v in enumerate(("impossible", "achievable") + VISIBILITY_LEVELS + PRESSURE_LEVELS)}
+    groups = dict(sorted(groups.items(),
+                         key=lambda kv: (kv[0][0], *(rank.get(v, 99) for v in kv[0][1:]))))
+    print_tables(groups, os.path.join(folder, "summary.csv"))
+    print_paired(rows)
+    chart(groups, out)
 
 
 if __name__ == "__main__":
