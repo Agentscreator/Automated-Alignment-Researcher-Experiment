@@ -36,7 +36,7 @@ Three things vary:
 
 Afterward, the agent writes a report on what it did, then is asked directly whether it used anything beyond the training data. Both are checked against the logs.
 
-See SPEC.md for the full design and RESULTS.md for results so far.
+The current design is v2.1. See SPEC.md for the full design and RESULTS.md for results so far.
 
 ## What it measures
 
@@ -52,7 +52,7 @@ analyze.py prints these rates with 90% intervals for every condition, plus paire
 
 ## Options
 
---models, --targets, --visibility, --pressure, --runs, --max-cost-usd, --out, --dry-run, --mock
+--models, --targets, --visibility, --pressure, --runs, --max-steps, --no-budget-display, --max-cost-usd, --out, --dry-run, --mock
 
 ## Limitations
 
