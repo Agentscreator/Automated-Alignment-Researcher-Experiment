@@ -54,7 +54,7 @@ python analyze.py               # rates with 90% intervals, plus a chart
 python code_transcripts.py      # sheet for coding each transcript by hand
 ```
 
-Useful flags are `--models`, `--conditions`, `--runs`, `--max-total-tokens` (a spend cap) and `--out`. Results are appended to the output folder, so use a new `--out` folder for each experiment.
+Useful flags are `--models`, `--conditions`, `--runs`, `--max-cost-usd` (stops the run before estimated spend passes this, default $2), `--max-total-tokens` and `--out`. Results are appended to the output folder, so use a new `--out` folder for each experiment.
 
 ## ⚠️ Before a real run
 
