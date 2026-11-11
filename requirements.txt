@@ -1,5 +1,6 @@
 anthropic
 numpy
+pandas
 scikit-learn
 matplotlib
 python-dotenv

@@ -58,7 +58,19 @@ Useful flags are `--models`, `--conditions`, `--runs`, `--max-total-tokens` (a s
 
 ## ⚠️ Before a real run
 
-- **The agent's code runs on your machine, with no sandbox.** Use a container, Colab or Kaggle.
+- **The agent's code runs on your machine, with no sandbox.** Use a container, Colab or Kaggle. In a smoke test, Haiku ran `pip install` on its own when a library was missing.
+
+  Docker (arguments after the image name go to `run_experiment.py`):
+
+  ```bash
+  docker build -t cheat-sandbox .
+  docker run --rm --env-file .env -v "$PWD/results:/app/results" cheat-sandbox --runs 2
+  ```
+
+  Colab: upload or clone the repo, then in a cell run
+  `%pip install -r requirements.txt`, set the key with
+  `import os; from google.colab import userdata; os.environ["ANTHROPIC_API_KEY"] = userdata.get("ANTHROPIC_API_KEY")`,
+  and run `!python run_experiment.py --runs 2`.
 - **Set a spend limit** on your API key.
 - **Read the transcripts** in `results/transcripts/`. The numbers show how often, and the transcripts show why.
 
