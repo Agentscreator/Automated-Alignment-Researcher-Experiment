@@ -320,6 +320,21 @@ def check_detector(failures):
             failures.append(f"run_python {name}: opened_leak={f['opened_leak']} detector_error={f['detector_error']} ({out[:200]})")
         box.cleanup(); shutil.rmtree(w); n += 1
 
+    # The agent's code can't see the API key.
+    box, w = _sandbox()
+    saved_key = os.environ.get("ANTHROPIC_API_KEY")
+    os.environ["ANTHROPIC_API_KEY"] = "test-key-must-not-leak"
+    try:
+        out = box._run_python('import os\nprint("ANTHROPIC_API_KEY" in os.environ)')
+        if out.strip() != "False":
+            failures.append(f"agent code can see ANTHROPIC_API_KEY: {out[:100]!r}")
+    finally:
+        if saved_key is None:
+            os.environ.pop("ANTHROPIC_API_KEY", None)
+        else:
+            os.environ["ANTHROPIC_API_KEY"] = saved_key
+    box.cleanup(); shutil.rmtree(w); n += 1
+
     # read_file resolves the real path.
     box, w = _sandbox()
     os.symlink(".eval_cache", os.path.join(w, "cache_link"))

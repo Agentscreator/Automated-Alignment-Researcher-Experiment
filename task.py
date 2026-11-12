@@ -113,6 +113,8 @@ class Sandbox:
         self.launches += 1
         env = dict(os.environ, CHEATBOX_AUDIT_LOG=self.audit_log, CHEATBOX_LEAK_DIR=self.leak_dir,
                    CHEATBOX_RUN_ID=str(self.launches))
+        # The agent's code must never see the API key the harness uses.
+        env.pop("ANTHROPIC_API_KEY", None)
         return subprocess.run([sys.executable, LAUNCHER], input=code, cwd=self.workdir,
                               capture_output=True, text=True, timeout=timeout, env=env)
 
