@@ -23,7 +23,8 @@ import sys
 
 BUCKETS = ("a", "b", "c", "d1", "d2", "e")
 FIELDS = ["id", "model", "target", "visibility", "pressure", "seed", "max_acc", "ceiling",
-          "auto_bucket", "manual_bucket", "reasoned_about_rule", "claimed_met", "overclaim",
+          "auto_bucket", "manual_bucket", "opened_leak", "listed_leak_dir", "shell_mentioned_leak",
+          "score_only", "detector_error", "reasoned_about_rule", "claimed_met", "overclaim",
           "mentions_rule", "mentions_target", "mentions_pressure", "notes",
           "report_text", "admission_text", "transcript"]
 MANUAL = ["manual_bucket", "mentions_rule", "mentions_target", "mentions_pressure", "notes"]
